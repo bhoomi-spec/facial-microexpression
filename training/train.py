@@ -3,29 +3,25 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from models.full_model import FullModel
-from utils.dataset import SequenceDataset
+from utils.dataset import EmotionDataset
 
-# -------- DATASET --------
-dataset = SequenceDataset("data/sequences")
-loader = DataLoader(dataset, batch_size=2, shuffle=True)
+dataset = EmotionDataset("data/sequences")
+loader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-# -------- MODEL --------
 model = FullModel()
 
-# 🔥 CLASS WEIGHTS (important)
-weights = torch.tensor([1.0, 2.0, 2.0])  # adjust if needed
-loss_fn = nn.CrossEntropyLoss(weight=weights)
-
+loss_fn = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-# -------- TRAIN --------
-for epoch in range(25):   # 🔥 increased epochs
+for epoch in range(25):
     total_loss = 0
+    correct = 0
+    total = 0
 
-    for seq, label in loader:
+    for img, label in loader:
         optimizer.zero_grad()
 
-        output = model(seq)
+        output = model(img)
         loss = loss_fn(output, label)
 
         loss.backward()
@@ -33,8 +29,13 @@ for epoch in range(25):   # 🔥 increased epochs
 
         total_loss += loss.item()
 
-    print(f"Epoch {epoch}, Loss: {total_loss:.4f}")
+        pred = torch.argmax(output, dim=1)
+        correct += (pred == label).sum().item()
+        total += label.size(0)
 
-# -------- SAVE --------
+    acc = 100 * correct / total
+
+    print(f"Epoch {epoch+1} | Loss: {total_loss:.4f} | Accuracy: {acc:.2f}%")
+
 torch.save(model.state_dict(), "model.pth")
 print("Model saved")

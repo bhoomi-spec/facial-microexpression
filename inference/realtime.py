@@ -1,169 +1,191 @@
 import cv2
-import numpy as np
 import torch
-from models.full_model import FullModel
+import numpy as np
 import mediapipe as mp
+from collections import deque
 
-# -------- MODEL --------
+from models.full_model import FullModel
+
+# ---------------- MODEL ----------------
 model = FullModel()
 model.load_state_dict(torch.load("model.pth", map_location="cpu"))
 model.eval()
 
-SEQ_LEN = 5
-sequence = []
-predictions = []
-
 emotion_map = {
-    0: "Happy",
-    1: "Disgust",
-    2: "Surprise"
+    0: "Surprised",
+    1: "Sad",
+    2: "Neutral",
+    3: "Happy",
+    4: "Fear",
+    5: "Disgust",
+    6: "Anger"
 }
 
-# -------- MEDIAPIPE --------
+# ---------------- MEDIAPIPE ----------------
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
-    refine_landmarks=True
+    refine_landmarks=True,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
 )
 
-# -------- CAMERA --------
-cap = cv2.VideoCapture(0)
-
-# FULLSCREEN WINDOW
-cv2.namedWindow("AI Mirror", cv2.WINDOW_NORMAL)
-cv2.setWindowProperty("AI Mirror", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
 mesh_style = mp_drawing.DrawingSpec(
-    color=(255, 255, 255),
+    color=(0, 255, 0),
     thickness=1,
     circle_radius=1
 )
 
+# ---------------- CAMERA ----------------
+cap = cv2.VideoCapture(0)
+
+cv2.namedWindow("AI Mirror", cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(
+    "AI Mirror",
+    cv2.WND_PROP_FULLSCREEN,
+    cv2.WINDOW_FULLSCREEN
+)
+
+# ---------------- SMOOTHING ----------------
+history = deque(maxlen=25)
+stable_label = "Thinking..."
+stable_conf = 0.0
+
+# ---------------- MOTION ----------------
 prev_gray = None
-final_label = 0
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+# ---------------- LOOP ----------------
+while True:
+    ret, frame = cap.read()
 
-        # MIRROR EFFECT
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
+    if not ret:
+        break
 
-        # ================= MOTION =================
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
 
-        if prev_gray is not None:
-            diff = cv2.absdiff(prev_gray, gray)
-            _, thresh = cv2.threshold(diff, 8, 255, cv2.THRESH_BINARY)
-            thresh = cv2.medianBlur(thresh, 7)
-            thresh = cv2.dilate(thresh, None, iterations=1)
-        else:
-            thresh = np.zeros((h, w), dtype=np.uint8)
+    # =====================================
+    # MOTION DETECTION
+    # =====================================
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        prev_gray = gray
+    if prev_gray is None:
+        motion = np.zeros((h, w), dtype=np.uint8)
+    else:
+        diff = cv2.absdiff(prev_gray, gray)
 
-        # ================= FACE MESH =================
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
+        # increased threshold
+        _, motion = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
+        motion = cv2.GaussianBlur(motion, (5, 5), 0)
+        motion = cv2.dilate(motion, None, iterations=2)
 
-                x_list, y_list = [], []
+    prev_gray = gray.copy()
 
-                for lm in face_landmarks.landmark:
-                    x_list.append(int(lm.x * w))
-                    y_list.append(int(lm.y * h))
+    # =====================================
+    # FACE MESH + EMOTION
+    # =====================================
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
 
-                x_min, x_max = min(x_list), max(x_list)
-                y_min, y_max = min(y_list), max(y_list)
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
 
-                if x_max > x_min and y_max > y_min:
+            xs = []
+            ys = []
 
-                    face_crop = frame[y_min:y_max, x_min:x_max]
-                    face_crop = cv2.resize(face_crop, (128, 128))
+            for lm in face_landmarks.landmark:
+                xs.append(int(lm.x * w))
+                ys.append(int(lm.y * h))
 
-                    img = face_crop / 255.0
-                    img = np.transpose(img, (2, 0, 1))
+            x1 = max(min(xs) - 20, 0)
+            y1 = max(min(ys) - 20, 0)
+            x2 = min(max(xs) + 20, w)
+            y2 = min(max(ys) + 20, h)
 
-                    sequence.append(img)
+            face = frame[y1:y2, x1:x2]
 
-                    if len(sequence) == SEQ_LEN:
+            if face.size > 0:
+                face = cv2.resize(face, (128, 128))
+                img = face.astype(np.float32) / 255.0
+                img = np.transpose(img, (2, 0, 1))
+                img = np.expand_dims(img, axis=0)
 
-                        seq_np = np.array(sequence)
-                        seq_np = np.expand_dims(seq_np, axis=0)
-                        seq = torch.tensor(seq_np, dtype=torch.float32)
+                img = torch.tensor(img, dtype=torch.float32)
 
-                        with torch.no_grad():
-                            pred = model(seq)
+                with torch.no_grad():
+                    pred = model(img)
+                    probs = torch.softmax(pred, dim=1)
 
-                            probs = torch.softmax(pred, dim=1)
-                            confidence, label = torch.max(probs, dim=1)
+                    conf, label = torch.max(probs, dim=1)
 
-                            label = label.item()
-                            confidence = confidence.item()
+                    conf = conf.item()
+                    label = label.item()
 
-                        # CONFIDENCE FILTER
-                        if confidence > 0.55:
-                            predictions.append(label)
+                # stronger confidence filter
+                if conf > 0.55:
+                    history.append(label)
 
-                            if len(predictions) > 3:
-                                predictions.pop(0)
+                if len(history) > 0:
+                    final = max(set(history), key=history.count)
+                    stable_label = emotion_map[final]
+                    stable_conf = conf
 
-                            final_label = max(set(predictions), key=predictions.count)
+            # CLEAN FACE MESH
+            overlay = frame.copy()
 
-                        emotion_text = emotion_map.get(final_label, str(final_label))
+            mp_drawing.draw_landmarks(
+                overlay,
+                face_landmarks,
+                mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=mesh_style,
+                connection_drawing_spec=mesh_style
+            )
 
-                        # DISPLAY TEXT
-                        cv2.putText(frame,
-                                    f"{emotion_text} ({confidence*100:.1f}%)",
-                                    (50, 80),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.5,
-                                    (0, 255, 0),
-                                    3)
+            frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
 
-                        sequence.pop(0)
+    # =====================================
+    # TEXT
+    # =====================================
+    cv2.putText(
+        frame,
+        f"{stable_label} {stable_conf*100:.1f}%",
+        (40, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.3,
+        (0, 255, 0),
+        3
+    )
 
-                # DRAW FACE MESH
-                overlay = frame.copy()
+    # =====================================
+    # FLOATING MOTION CAM
+    # =====================================
+    motion_small = cv2.resize(motion, (220, 160))
+    motion_small = cv2.cvtColor(motion_small, cv2.COLOR_GRAY2BGR)
 
-                mp_drawing.draw_landmarks(
-                    overlay,
-                    face_landmarks,
-                    mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=mesh_style,
-                    connection_drawing_spec=mesh_style
-                )
+    frame[20:180, w-240:w-20] = motion_small
 
-                frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+    cv2.rectangle(frame, (w-240, 20), (w-20, 180), (0, 255, 255), 2)
 
-        # ================= FLOATING MOTION =================
-        motion_small = cv2.resize(thresh, (200, 150))
-        motion_small = cv2.cvtColor(motion_small, cv2.COLOR_GRAY2BGR)
+    cv2.putText(
+        frame,
+        "Motion",
+        (w-210, 15),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2
+    )
 
-        frame[20:170, w-220:w-20] = motion_small
+    # =====================================
+    # DISPLAY
+    # =====================================
+    cv2.imshow("AI Mirror", frame)
 
-        cv2.putText(frame, "Motion",
-                    (w-200, 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 255),
-                    2)
-
-        # ================= DISPLAY =================
-        cv2.imshow("AI Mirror", frame)
-
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-except KeyboardInterrupt:
-    print("Stopped by user")
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
 cap.release()
 cv2.destroyAllWindows()
